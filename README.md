@@ -2,10 +2,14 @@
 
 This project turns `property_listings_MM.xlsx` into a Streamlit dashboard for reviewing listings and saving your unit-viewing checklist.
 
+## Live App
+
+https://mxmunitviewing.streamlit.app/
+
 ## What it does
 
-- Loads both workbook tabs into one dashboard view.
-- Lets you filter by source list, rent, property type, furnishing, co-living, and review status.
+- Loads the workbook into one dashboard view.
+- Lets you filter by rent, MRT station, MRT distance, property type, furnishing, co-living, and review status.
 - Adds a persistent checklist for each listing covering:
   - Utilities + air-con inclusion
   - Water heater
