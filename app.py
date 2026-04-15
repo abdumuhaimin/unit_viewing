@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from io import BytesIO
 from pathlib import Path
 import re
 
@@ -273,9 +274,7 @@ def workbook_signature(workbook_path: Path) -> tuple[int, int]:
     return stat.st_mtime_ns, stat.st_size
 
 
-@st.cache_data(show_spinner=False)
-def load_listings(workbook_path: str, _workbook_signature: tuple[int, int]) -> pd.DataFrame:
-    workbook = pd.ExcelFile(workbook_path)
+def build_listing_records(workbook: pd.ExcelFile) -> pd.DataFrame:
     records: list[dict[str, object]] = []
     for sheet_name in workbook.sheet_names:
         frame = pd.read_excel(workbook, sheet_name=sheet_name)
@@ -327,6 +326,18 @@ def load_listings(workbook_path: str, _workbook_signature: tuple[int, int]) -> p
             record["listing_group"] = build_group_key(record)
             records.append(record)
     return pd.DataFrame(records)
+
+
+@st.cache_data(show_spinner=False)
+def load_listings(workbook_path: str, _workbook_signature: tuple[int, int]) -> pd.DataFrame:
+    workbook = pd.ExcelFile(workbook_path)
+    return build_listing_records(workbook)
+
+
+@st.cache_data(show_spinner=False)
+def load_uploaded_listings(workbook_bytes: bytes, workbook_name: str) -> pd.DataFrame:
+    workbook = pd.ExcelFile(BytesIO(workbook_bytes))
+    return build_listing_records(workbook)
 
 
 @st.cache_data(show_spinner=False)
@@ -945,11 +956,20 @@ def main() -> None:
     st.set_page_config(page_title="Unit Viewing Dashboard", layout="wide")
     inject_styles()
 
-    if not WORKBOOK_PATH.exists():
-        st.error(f"Workbook not found: {WORKBOOK_PATH.name}")
-        st.stop()
+    if WORKBOOK_PATH.exists():
+        st.caption(f"Using local workbook: {WORKBOOK_PATH.name}")
+        listings = load_listings(str(WORKBOOK_PATH), workbook_signature(WORKBOOK_PATH))
+    else:
+        st.info("Upload your Excel workbook to use the dashboard. The repository does not store the source workbook.")
+        uploaded_workbook = st.file_uploader(
+            "Upload property_listings_MM.xlsx",
+            type=["xlsx"],
+            accept_multiple_files=False,
+        )
+        if uploaded_workbook is None:
+            st.stop()
+        listings = load_uploaded_listings(uploaded_workbook.getvalue(), uploaded_workbook.name)
 
-    listings = load_listings(str(WORKBOOK_PATH), workbook_signature(WORKBOOK_PATH))
     reviews = load_reviews(str(REVIEWS_PATH))
     dashboard = build_dashboard_data(listings, reviews)
     filtered = filter_dashboard(dashboard)

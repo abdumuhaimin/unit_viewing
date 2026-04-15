@@ -6,6 +6,8 @@ This project turns `property_listings_MM.xlsx` into a Streamlit dashboard for re
 
 https://mxmunitviewing.streamlit.app/
 
+The GitHub repo does not store the source workbook. On deployed environments, upload `property_listings_MM.xlsx` when the app prompts for it.
+
 ## What it does
 
 - Loads the workbook into one dashboard view.
@@ -42,5 +44,5 @@ https://mxmunitviewing.streamlit.app/
 ## Files
 
 - `app.py` - dashboard app
-- `property_listings_MM.xlsx` - source workbook
+- `property_listings_MM.xlsx` - source workbook kept locally and intentionally excluded from git
 - `unit_viewing_reviews.csv` - saved checklist data, created after your first save
