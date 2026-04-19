@@ -1,9 +1,11 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from io import BytesIO
 from pathlib import Path
 import re
+from urllib.parse import urlencode
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import streamlit as st
@@ -30,6 +32,16 @@ UTILITIES_OPTIONS = [
 ]
 SUN_OPTIONS = ["Unknown", "Sunrise", "Sunset", "Both", "Need to verify"]
 KITCHEN_OPTIONS = ["Not applicable", "Common kitchen", "Private kitchen", "Need to verify"]
+VIEWING_OUTCOME_OPTIONS = ["Pending", "OK", "Not OK"]
+SINGAPORE_TIMEZONE = ZoneInfo("Asia/Singapore")
+GOOGLE_CALENDAR_GUESTS = [
+    "abdumuhaiminhashim@gmail.com",
+    "maisarahkm@gmail.com",
+]
+BOOKING_TIME_PATTERN = re.compile(
+    r"^\s*(\d{1,2})\s+([A-Za-z]+),\s*[A-Za-z]{3}\s*@\s*(\d{1,2}:\d{2}\s*[ap]m)\s*$",
+    re.IGNORECASE,
+)
 
 CHECKLIST_FIELDS = [
     ("utilities_aircon_inclusive", "Price inclusive of utilities + air-con?"),
@@ -46,6 +58,8 @@ CHECKLIST_FIELDS = [
 
 REVIEW_COLUMNS = [
     "listing_key",
+    "viewed_unit",
+    "viewing_outcome",
     "utilities_aircon_inclusive",
     "water_heater",
     "washing_machine",
@@ -65,8 +79,6 @@ def text_value(value: object, fallback: str = "") -> str:
     if value is None:
         return fallback
     if isinstance(value, float) and pd.isna(value):
-        return fallback
-    if pd.isna(value):
         return fallback
     text = str(value).strip()
     return text or fallback
@@ -195,8 +207,18 @@ def build_search_blob(
     nearest_mrt: str,
     notes: str,
     mrt_stations: list[str],
+    booking_time: str,
+    agent_contact: str,
 ) -> str:
-    parts = [listing_name, address, nearest_mrt, notes, " ".join(mrt_stations)]
+    parts = [
+        listing_name,
+        address,
+        nearest_mrt,
+        notes,
+        " ".join(mrt_stations),
+        booking_time,
+        agent_contact,
+    ]
     if nearest_mrt:
         parts.append("mrt")
     return " ".join(normalize_search_text(part) for part in parts if part)
@@ -251,9 +273,139 @@ def format_number(value: float | None, suffix: str = "") -> str:
     return f"{value:,.2f}{suffix}"
 
 
+def listing_label(row: pd.Series) -> str:
+    outcome = text_value(row.get("viewing_outcome"))
+    status = text_value(row.get("review_status"))
+    if outcome == "OK":
+        badge = "✓"
+    elif outcome == "Not OK":
+        badge = "✗"
+    elif status == "Complete":
+        badge = "●"
+    elif status == "In progress":
+        badge = "◐"
+    else:
+        badge = "○"
+    return f"{badge} {row['listing_name']} | {format_currency(row['monthly_rent'])} | {row['source_sheet']}"
+
+
+def parse_booking_datetime(value: object, now: datetime | None = None) -> datetime | None:
+    booking_time = text_value(value)
+    if not booking_time:
+        return None
+
+    match = BOOKING_TIME_PATTERN.match(booking_time)
+    if not match:
+        return None
+
+    day, month_name, time_text = match.groups()
+    reference = now or datetime.now(SINGAPORE_TIMEZONE)
+    parsed = datetime.strptime(
+        f"{int(day):02d} {month_name} {reference.year} {time_text.upper().replace(' ', '')}",
+        "%d %B %Y %I:%M%p",
+    ).replace(tzinfo=SINGAPORE_TIMEZONE)
+
+    if parsed < reference - timedelta(days=180):
+        parsed = parsed.replace(year=parsed.year + 1)
+
+    return parsed
+
+
+def escape_ics_text(value: str) -> str:
+    return (
+        value.replace("\\", "\\\\")
+        .replace(";", "\\;")
+        .replace(",", "\\,")
+        .replace("\n", "\\n")
+    )
+
+
+def build_calendar_event_details(selected: pd.Series) -> tuple[datetime, datetime, str, list[str]] | None:
+    start_time = parse_booking_datetime(selected.get("booking_time"))
+    if start_time is None:
+        return None
+
+    end_time = start_time + timedelta(hours=1)
+    address = text_value(selected.get("address"))
+    location = address if address and address != "Address not provided" else text_value(selected.get("listing_name"))
+    description_parts = [
+        f"Listing: {text_value(selected.get('listing_name'))}",
+        f"Booking time: {text_value(selected.get('booking_time'))}",
+    ]
+    if address and address != "Address not provided":
+        description_parts.append(f"Address: {address}")
+    agent_contact = text_value(selected.get("agent_contact"))
+    if agent_contact:
+        description_parts.append(f"Agent / Contact: {agent_contact}")
+    notes = text_value(selected.get("notes"))
+    if notes and notes != "No notes in source sheet":
+        description_parts.append(f"Notes: {notes}")
+    listing_url = text_value(selected.get("listing_url"))
+    if listing_url:
+        description_parts.append(f"Listing URL: {listing_url}")
+
+    return start_time, end_time, location, description_parts
+
+
+def build_google_calendar_url(selected: pd.Series) -> str | None:
+    event_details = build_calendar_event_details(selected)
+    if event_details is None:
+        return None
+
+    start_time, end_time, location, description_parts = event_details
+    params = {
+        "action": "TEMPLATE",
+        "text": f"Unit Viewing - {text_value(selected.get('listing_name'))}",
+        "dates": f"{start_time.strftime('%Y%m%dT%H%M%S')}/{end_time.strftime('%Y%m%dT%H%M%S')}",
+        "ctz": "Asia/Singapore",
+        "details": "\n".join(description_parts),
+        "location": location,
+        "add": ",".join(GOOGLE_CALENDAR_GUESTS),
+    }
+    return "https://calendar.google.com/calendar/render?" + urlencode(params)
+
+
+def build_calendar_invite(selected: pd.Series) -> tuple[str, str] | None:
+    event_details = build_calendar_event_details(selected)
+    if event_details is None:
+        return None
+
+    start_time, end_time, location, description_parts = event_details
+
+    now_utc = datetime.now(ZoneInfo("UTC")).strftime("%Y%m%dT%H%M%SZ")
+    uid = f"{slugify(text_value(selected.get('listing_key')))}-{start_time.strftime('%Y%m%dT%H%M%S')}@unit-viewing"
+    ics_body = "\r\n".join(
+        [
+            "BEGIN:VCALENDAR",
+            "VERSION:2.0",
+            "PRODID:-//Unit Viewing Dashboard//EN",
+            "CALSCALE:GREGORIAN",
+            "BEGIN:VEVENT",
+            f"UID:{uid}",
+            f"DTSTAMP:{now_utc}",
+            f"DTSTART;TZID=Asia/Singapore:{start_time.strftime('%Y%m%dT%H%M%S')}",
+            f"DTEND;TZID=Asia/Singapore:{end_time.strftime('%Y%m%dT%H%M%S')}",
+            f"SUMMARY:{escape_ics_text('Unit Viewing - ' + text_value(selected.get('listing_name')))}",
+            f"LOCATION:{escape_ics_text(location)}",
+            f"DESCRIPTION:{escape_ics_text(chr(10).join(description_parts))}",
+            *[
+                f"ATTENDEE;ROLE=REQ-PARTICIPANT;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:{email}"
+                for email in GOOGLE_CALENDAR_GUESTS
+            ],
+            "END:VEVENT",
+            "END:VCALENDAR",
+            "",
+        ]
+    )
+    file_name = f"{slugify(text_value(selected.get('listing_name')))}-unit-viewing.ics"
+    return ics_body, file_name
+
+
 def review_defaults() -> dict[str, str]:
     return {
         "listing_key": "",
+        "viewed_unit": "No",
+        "viewing_outcome": VIEWING_OUTCOME_OPTIONS[0],
         "utilities_aircon_inclusive": UTILITIES_OPTIONS[0],
         "water_heater": YES_NO_OPTIONS[0],
         "washing_machine": YES_NO_OPTIONS[0],
@@ -279,11 +431,13 @@ def build_listing_records(workbook: pd.ExcelFile) -> pd.DataFrame:
     for sheet_name in workbook.sheet_names:
         frame = pd.read_excel(workbook, sheet_name=sheet_name)
         note_columns = [column for column in ["Notes", "Notes.1", "Unnamed: 12"] if column in frame.columns]
-        for index, row in frame.iterrows():
+        for position, (index, row) in enumerate(frame.iterrows()):
             notes, listing_url = parse_note_fields(row, note_columns)
-            listing_name = text_value(row.get("Listing Name"), fallback=f"Listing {index + 1}")
+            listing_name = text_value(row.get("Listing Name"), fallback=f"Listing {position + 1}")
             address = text_value(row.get("Address"), fallback="Address not provided")
             nearest_mrt = text_value(row.get("Nearest MRT station"))
+            booking_time = text_value(row.get("Booking time"))
+            agent_contact = text_value(row.get("Agent name / Contact No"))
             mrt_stations = parse_mrt_stations(nearest_mrt)
             nearest_mrt_minutes = best_mrt_minutes(nearest_mrt)
             nearest_mrt_station_name = nearest_mrt_station(nearest_mrt)
@@ -297,10 +451,10 @@ def build_listing_records(workbook: pd.ExcelFile) -> pd.DataFrame:
                 ]
             )
             record = {
-                "listing_key": f"{sheet_name}:{text_value(row.get('#'), str(index + 1))}:{slugify(listing_name)}",
+                "listing_key": f"{sheet_name}:{text_value(row.get('#'), str(position + 1))}:{slugify(listing_name)}",
                 "listing_group": "",
                 "source_sheet": sheet_name,
-                "listing_number": text_value(row.get("#"), str(index + 1)),
+                "listing_number": text_value(row.get("#"), str(position + 1)),
                 "listing_name": listing_name,
                 "address": address,
                 "nearest_mrt": nearest_mrt,
@@ -317,9 +471,19 @@ def build_listing_records(workbook: pd.ExcelFile) -> pd.DataFrame:
                 "furnishing": text_value(row.get("Furnishing"), "Unknown"),
                 "lease_period": text_value(row.get("Lease Period"), "Not listed"),
                 "year_built": text_value(row.get("Year Built"), "Not listed"),
+                "booking_time": booking_time,
+                "agent_contact": agent_contact,
                 "notes": notes or "No notes in source sheet",
                 "listing_url": listing_url,
-                "search_blob": build_search_blob(listing_name, address, nearest_mrt, notes, mrt_stations),
+                "search_blob": build_search_blob(
+                    listing_name,
+                    address,
+                    nearest_mrt,
+                    notes,
+                    mrt_stations,
+                    booking_time,
+                    agent_contact,
+                ),
                 "mrt_search_blob": build_mrt_search_blob(nearest_mrt, mrt_stations),
                 "is_co_living": is_co_living_listing(description_text),
             }
@@ -384,6 +548,12 @@ def applicable_checklist_keys(is_co_living: bool) -> list[str]:
     return keys
 
 
+def has_viewing_activity(row: pd.Series) -> bool:
+    viewed_unit = text_value(row.get("viewed_unit"))
+    viewing_outcome = text_value(row.get("viewing_outcome"))
+    return viewed_unit == "Yes" or viewing_outcome in {"OK", "Not OK"}
+
+
 def add_review_summary(data: pd.DataFrame) -> pd.DataFrame:
     data = data.copy()
     answered_counts: list[int] = []
@@ -396,9 +566,10 @@ def add_review_summary(data: pd.DataFrame) -> pd.DataFrame:
             field_answered(field_key, row.get(field_key), bool(row["is_co_living"]))
             for field_key in checklist_keys
         )
+        review_started = answered_fields > 0 or has_viewing_activity(row)
         answered_counts.append(answered_fields)
         total_counts.append(total_fields)
-        if answered_fields == 0:
+        if not review_started:
             completion_labels.append("Not reviewed")
         elif answered_fields >= total_fields:
             completion_labels.append("Complete")
@@ -620,6 +791,17 @@ def filter_dashboard(data: pd.DataFrame) -> pd.DataFrame:
         ["All", "Not reviewed", "In progress", "Complete"],
     )
 
+    viewed_filter = st.sidebar.selectbox(
+        "Viewed status",
+        ["All", "Viewed only", "Not viewed"],
+    )
+
+    selected_outcomes = st.sidebar.multiselect(
+        "Viewing outcome",
+        VIEWING_OUTCOME_OPTIONS,
+        default=VIEWING_OUTCOME_OPTIONS,
+    )
+
     filtered = data.copy()
     if selected_sources:
         filtered = filtered[filtered["source_sheet"].isin(selected_sources)]
@@ -638,6 +820,14 @@ def filter_dashboard(data: pd.DataFrame) -> pd.DataFrame:
 
     if review_filter != "All":
         filtered = filtered[filtered["review_status"] == review_filter]
+
+    if viewed_filter == "Viewed only":
+        filtered = filtered[filtered["viewed_unit"] == "Yes"]
+    elif viewed_filter == "Not viewed":
+        filtered = filtered[filtered["viewed_unit"] != "Yes"]
+
+    if selected_outcomes:
+        filtered = filtered[filtered["viewing_outcome"].isin(selected_outcomes)]
 
     if selected_mrt_stations:
         filtered = filtered[
@@ -661,7 +851,9 @@ def filter_dashboard(data: pd.DataFrame) -> pd.DataFrame:
             )
         ]
 
-    return filtered.sort_values(by=["monthly_rent", "listing_name"], na_position="last")
+    filtered = filtered.sort_values(by=["monthly_rent", "listing_name"], na_position="last")
+    st.sidebar.caption(f"Showing {len(filtered)} of {len(data)} listings")
+    return filtered
 
 
 def missing_checklist_items(row: pd.Series) -> list[str]:
@@ -680,15 +872,16 @@ def review_for_listing(listing_key: str, reviews: pd.DataFrame) -> dict[str, str
         defaults["listing_key"] = listing_key
         return defaults
     record = reviews.loc[reviews["listing_key"] == listing_key].iloc[0].to_dict()
+    result: dict[str, str] = {}
     for column, default in defaults.items():
-        record[column] = text_value(record.get(column), default)
-    return record
+        result[column] = text_value(record.get(column), default)
+    return result
 
 
 def render_hero(filtered: pd.DataFrame) -> None:
     avg_rent = filtered["monthly_rent"].mean() if not filtered.empty else None
-    reviewed_units = int((filtered["review_status"] != "Not reviewed").sum())
-    not_reviewed_units = int((filtered["review_status"] == "Not reviewed").sum())
+    viewed_units = int((filtered["viewed_unit"] == "Yes").sum())
+    ok_outcomes = int((filtered["viewing_outcome"] == "OK").sum())
     st.markdown(
         f"""
         <div class="hero-shell">
@@ -702,8 +895,8 @@ def render_hero(filtered: pd.DataFrame) -> None:
     stats = st.columns(4)
     stat_values = [
         ("Visible entries", str(len(filtered))),
-        ("Reviewed", str(reviewed_units)),
-        ("Not reviewed", str(not_reviewed_units)),
+        ("Viewed units", str(viewed_units)),
+        ("OK outcomes", str(ok_outcomes)),
         ("Average rent", format_currency(avg_rent)),
     ]
     for column, (label, value) in zip(stats, stat_values):
@@ -718,15 +911,39 @@ def render_hero(filtered: pd.DataFrame) -> None:
                 unsafe_allow_html=True,
             )
 
+    now = datetime.now(SINGAPORE_TIMEZONE)
+    upcoming = []
+    for _, row in filtered.iterrows():
+        dt = parse_booking_datetime(row.get("booking_time"), now)
+        if dt and now <= dt <= now + timedelta(days=7):
+            upcoming.append((dt, text_value(row.get("listing_name"))))
+    if upcoming:
+        upcoming.sort()
+        lines = [f"• **{name}** — {dt.strftime('%a, %d %b @ %I:%M %p')}" for dt, name in upcoming]
+        st.info("**Upcoming viewings (next 7 days)**\n\n" + "\n\n".join(lines))
+
 
 def render_overview(filtered: pd.DataFrame) -> None:
     if filtered.empty:
         st.info("No listings match the current filters.")
         return
 
+    sort_options = {
+        "Rent: low to high": ("monthly_rent", True),
+        "Rent: high to low": ("monthly_rent", False),
+        "MRT: nearest first": ("nearest_mrt_minutes", True),
+        "Name: A to Z": ("listing_name", True),
+    }
+
     left, right = st.columns([1.05, 1])
     with left:
-        st.subheader("Listings")
+        sort_header, sort_control = st.columns([1, 1])
+        with sort_header:
+            st.subheader("Listings")
+        with sort_control:
+            sort_choice = st.selectbox("Sort by", list(sort_options.keys()), label_visibility="collapsed")
+        sort_col, sort_asc = sort_options[sort_choice]
+        filtered = filtered.sort_values(sort_col, ascending=sort_asc, na_position="last")
         display = filtered[
             [
                 "source_sheet",
@@ -734,6 +951,10 @@ def render_overview(filtered: pd.DataFrame) -> None:
                 "monthly_rent",
                 "nearest_mrt_station",
                 "nearest_mrt_minutes",
+                "booking_time",
+                "agent_contact",
+                "viewed_unit",
+                "viewing_outcome",
                 "size_sqft",
                 "property_type",
                 "review_status",
@@ -745,6 +966,10 @@ def render_overview(filtered: pd.DataFrame) -> None:
                 "monthly_rent": "Rent (S$)",
                 "nearest_mrt_station": "Nearest MRT",
                 "nearest_mrt_minutes": "Distance to MRT",
+                "booking_time": "Booking time",
+                "agent_contact": "Agent / Contact",
+                "viewed_unit": "Viewed",
+                "viewing_outcome": "Outcome",
                 "size_sqft": "Size (sqft)",
                 "property_type": "Type",
                 "review_status": "Checklist",
@@ -790,6 +1015,10 @@ def render_listing_detail(selected: pd.Series) -> None:
                 <div class="detail-tile"><div class="label">Address</div><div class="value">{selected['address']}</div></div>
                 <div class="detail-tile"><div class="label">Nearest MRT</div><div class="value">{selected['nearest_mrt_station'] or 'Not listed'}</div></div>
                 <div class="detail-tile"><div class="label">MRT Distance</div><div class="value">{format_number(selected['nearest_mrt_minutes'], ' min')}</div></div>
+                <div class="detail-tile"><div class="label">Booking Time</div><div class="value">{selected['booking_time'] or 'Not listed'}</div></div>
+                <div class="detail-tile"><div class="label">Agent / Contact</div><div class="value">{selected['agent_contact'] or 'Not listed'}</div></div>
+                <div class="detail-tile"><div class="label">Viewed</div><div class="value">{selected['viewed_unit']}</div></div>
+                <div class="detail-tile"><div class="label">Outcome</div><div class="value">{selected['viewing_outcome']}</div></div>
                 <div class="detail-tile"><div class="label">Beds / Baths</div><div class="value">{selected['beds']} / {selected['baths']}</div></div>
                 <div class="detail-tile"><div class="label">Size</div><div class="value">{format_number(selected['size_sqft'], ' sqft')}</div></div>
                 <div class="detail-tile"><div class="label">PSF</div><div class="value">{format_number(selected['psf_sgd'])}</div></div>
@@ -799,8 +1028,25 @@ def render_listing_detail(selected: pd.Series) -> None:
         unsafe_allow_html=True,
     )
 
-    if selected["listing_url"]:
-        st.link_button("Open source listing", selected["listing_url"], width="content")
+    action_columns = st.columns(3)
+    with action_columns[0]:
+        if selected["listing_url"]:
+            st.link_button("Open source listing", selected["listing_url"], width="content")
+    with action_columns[1]:
+        google_calendar_url = build_google_calendar_url(selected)
+        if google_calendar_url is not None:
+            st.link_button("Open Google Calendar invite", google_calendar_url, width="content")
+    with action_columns[2]:
+        invite = build_calendar_invite(selected)
+        if invite is not None:
+            invite_content, invite_name = invite
+            st.download_button(
+                "Download calendar invite",
+                data=invite_content,
+                file_name=invite_name,
+                mime="text/calendar",
+                width="content",
+            )
     st.markdown("**Source notes**")
     st.write(selected["notes"])
 
@@ -822,6 +1068,19 @@ def render_listing_detail(selected: pd.Series) -> None:
 def render_review_form(selected: pd.Series, reviews: pd.DataFrame) -> None:
     review = review_for_listing(selected["listing_key"], reviews)
     with st.form(f"review-{selected['listing_key']}"):
+        st.markdown("**Viewing status**")
+        status_left, status_right = st.columns(2)
+        with status_left:
+            viewed_unit = st.checkbox("Viewed this unit", value=review["viewed_unit"] == "Yes")
+        with status_right:
+            viewing_outcome = st.selectbox(
+                "Viewing outcome",
+                VIEWING_OUTCOME_OPTIONS,
+                index=option_index(VIEWING_OUTCOME_OPTIONS, review["viewing_outcome"]),
+                help="Saved as Pending if the unit has not been viewed yet.",
+            )
+
+        st.markdown("**Checklist details**")
         left, right = st.columns(2)
         with left:
             utilities_aircon_inclusive = st.selectbox(
@@ -885,6 +1144,8 @@ def render_review_form(selected: pd.Series, reviews: pd.DataFrame) -> None:
     if submitted:
         record = {
             "listing_key": selected["listing_key"],
+            "viewed_unit": "Yes" if viewed_unit else "No",
+            "viewing_outcome": viewing_outcome if viewed_unit else VIEWING_OUTCOME_OPTIONS[0],
             "utilities_aircon_inclusive": utilities_aircon_inclusive,
             "water_heater": water_heater,
             "washing_machine": washing_machine,
@@ -904,6 +1165,40 @@ def render_review_form(selected: pd.Series, reviews: pd.DataFrame) -> None:
 
 
 def render_tracker(data: pd.DataFrame) -> None:
+    booked = data[data["booking_time"].astype(str).str.strip() != ""].copy()
+    if not booked.empty:
+        st.subheader("Booked Viewings")
+        booked["google_calendar_url"] = booked.apply(build_google_calendar_url, axis=1)
+        booked_view = booked[
+            [
+                "listing_name",
+                "booking_time",
+                "agent_contact",
+                "address",
+                "google_calendar_url",
+            ]
+        ].rename(
+            columns={
+                "listing_name": "Listing",
+                "booking_time": "Booking time",
+                "agent_contact": "Agent / Contact",
+                "address": "Address",
+                "google_calendar_url": "Google Calendar",
+            }
+        )
+        st.dataframe(
+            booked_view,
+            hide_index=True,
+            width="stretch",
+            column_config={
+                "Google Calendar": st.column_config.LinkColumn(
+                    "Google Calendar",
+                    display_text="Open invite",
+                )
+            },
+        )
+
+    st.subheader("Review Tracker")
     reviewed = data[data["review_status"] != "Not reviewed"].copy()
     st.caption(f"Saved reviews are written to {REVIEWS_PATH.name} in the project root.")
     if reviewed.empty:
@@ -914,6 +1209,8 @@ def render_tracker(data: pd.DataFrame) -> None:
         [
             "listing_name",
             "source_sheet",
+            "viewed_unit",
+            "viewing_outcome",
             "review_status",
             "answered_fields",
             "total_fields",
@@ -929,6 +1226,8 @@ def render_tracker(data: pd.DataFrame) -> None:
         columns={
             "listing_name": "Listing",
             "source_sheet": "List",
+            "viewed_unit": "Viewed",
+            "viewing_outcome": "Outcome",
             "review_status": "Status",
             "answered_fields": "Answered",
             "total_fields": "Required",
@@ -987,7 +1286,7 @@ def main() -> None:
 
     with review_tab:
         labels = {
-            row["listing_key"]: f"{row['listing_name']} | {format_currency(row['monthly_rent'])} | {row['source_sheet']}"
+            row["listing_key"]: listing_label(row)
             for _, row in filtered.iterrows()
         }
         listing_keys = filtered["listing_key"].tolist()
@@ -1005,7 +1304,7 @@ def main() -> None:
         with left:
             render_listing_detail(selected)
         with right:
-            st.subheader("Viewing checklist")
+            st.subheader("Viewing checklist & outcome")
             render_review_form(selected, reviews)
 
     with tracker_tab:
