@@ -286,7 +286,49 @@ def listing_label(row: pd.Series) -> str:
         badge = "◐"
     else:
         badge = "○"
-    return f"{badge} {row['listing_name']} | {format_currency(row['monthly_rent'])} | {row['source_sheet']}"
+    booking_confirmed = text_value(row.get("booking_confirmed"))
+    if booking_confirmed == "confirmed":
+        booking_suffix = " · ✓ confirmed"
+    elif booking_confirmed == "unconfirmed":
+        booking_suffix = " · ⚠ unconfirmed"
+    else:
+        booking_suffix = ""
+    return f"{badge} {row['listing_name']} | {format_currency(row['monthly_rent'])} | {row['source_sheet']}{booking_suffix}"
+
+
+def _is_red_font(cell: object) -> bool:
+    try:
+        color = cell.font.color  # type: ignore[attr-defined]
+        if color.type == "rgb":
+            rgb: str = color.rgb  # e.g. "FFFF0000" (alpha + R + G + B)
+            r = int(rgb[2:4], 16)
+            g = int(rgb[4:6], 16)
+            b = int(rgb[6:8], 16)
+            return r > 150 and g < 100 and b < 100
+    except Exception:
+        pass
+    return False
+
+
+def extract_booking_confirmation(workbook_source: str | BytesIO) -> dict[tuple[str, int], str]:
+    import openpyxl
+    wb = openpyxl.load_workbook(workbook_source, data_only=True)
+    result: dict[tuple[str, int], str] = {}
+    for sheet_name in wb.sheetnames:
+        ws = wb[sheet_name]
+        booking_col: int | None = None
+        for cell in next(ws.iter_rows(min_row=1, max_row=1)):
+            if cell.value and "booking" in str(cell.value).lower():
+                booking_col = cell.column
+                break
+        if booking_col is None:
+            continue
+        for row_idx, row in enumerate(ws.iter_rows(min_row=2)):
+            booking_cell = row[booking_col - 1]
+            if booking_cell.value:
+                status = "unconfirmed" if _is_red_font(booking_cell) else "confirmed"
+                result[(sheet_name, row_idx)] = status
+    return result
 
 
 def parse_booking_datetime(value: object, now: datetime | None = None) -> datetime | None:
@@ -426,7 +468,10 @@ def workbook_signature(workbook_path: Path) -> tuple[int, int]:
     return stat.st_mtime_ns, stat.st_size
 
 
-def build_listing_records(workbook: pd.ExcelFile) -> pd.DataFrame:
+def build_listing_records(
+    workbook: pd.ExcelFile,
+    booking_confirmation: dict[tuple[str, int], str] | None = None,
+) -> pd.DataFrame:
     records: list[dict[str, object]] = []
     for sheet_name in workbook.sheet_names:
         frame = pd.read_excel(workbook, sheet_name=sheet_name)
@@ -438,6 +483,7 @@ def build_listing_records(workbook: pd.ExcelFile) -> pd.DataFrame:
             nearest_mrt = text_value(row.get("Nearest MRT station"))
             booking_time = text_value(row.get("Booking time"))
             agent_contact = text_value(row.get("Agent name / Contact No"))
+            booking_confirmed = (booking_confirmation or {}).get((sheet_name, position), "" if not booking_time else "confirmed")
             mrt_stations = parse_mrt_stations(nearest_mrt)
             nearest_mrt_minutes = best_mrt_minutes(nearest_mrt)
             nearest_mrt_station_name = nearest_mrt_station(nearest_mrt)
@@ -472,6 +518,7 @@ def build_listing_records(workbook: pd.ExcelFile) -> pd.DataFrame:
                 "lease_period": text_value(row.get("Lease Period"), "Not listed"),
                 "year_built": text_value(row.get("Year Built"), "Not listed"),
                 "booking_time": booking_time,
+                "booking_confirmed": booking_confirmed,
                 "agent_contact": agent_contact,
                 "notes": notes or "No notes in source sheet",
                 "listing_url": listing_url,
@@ -494,14 +541,16 @@ def build_listing_records(workbook: pd.ExcelFile) -> pd.DataFrame:
 
 @st.cache_data(show_spinner=False)
 def load_listings(workbook_path: str, _workbook_signature: tuple[int, int]) -> pd.DataFrame:
+    booking_confirmation = extract_booking_confirmation(workbook_path)
     workbook = pd.ExcelFile(workbook_path)
-    return build_listing_records(workbook)
+    return build_listing_records(workbook, booking_confirmation)
 
 
 @st.cache_data(show_spinner=False)
 def load_uploaded_listings(workbook_bytes: bytes, workbook_name: str) -> pd.DataFrame:
+    booking_confirmation = extract_booking_confirmation(BytesIO(workbook_bytes))
     workbook = pd.ExcelFile(BytesIO(workbook_bytes))
-    return build_listing_records(workbook)
+    return build_listing_records(workbook, booking_confirmation)
 
 
 @st.cache_data(show_spinner=False)
@@ -589,7 +638,16 @@ def build_dashboard_data(listings: pd.DataFrame, reviews: pd.DataFrame) -> pd.Da
         if column == "listing_key":
             continue
         dashboard[column] = dashboard[column].fillna(default)
-    return add_review_summary(dashboard)
+    dashboard = add_review_summary(dashboard)
+    # Deduplicate across sheets: per listing_group keep the most-reviewed copy,
+    # falling back to original sheet order when review data is equal.
+    dashboard = (
+        dashboard
+        .sort_values("answered_fields", ascending=False, kind="stable")
+        .drop_duplicates(subset=["listing_group"], keep="first")
+        .reset_index(drop=True)
+    )
+    return dashboard
 
 
 def option_index(options: list[str], current: str) -> int:
@@ -916,10 +974,19 @@ def render_hero(filtered: pd.DataFrame) -> None:
     for _, row in filtered.iterrows():
         dt = parse_booking_datetime(row.get("booking_time"), now)
         if dt and now <= dt <= now + timedelta(days=7):
-            upcoming.append((dt, text_value(row.get("listing_name"))))
+            confirmed = text_value(row.get("booking_confirmed"))
+            upcoming.append((dt, text_value(row.get("listing_name")), confirmed))
     if upcoming:
         upcoming.sort()
-        lines = [f"• **{name}** — {dt.strftime('%a, %d %b @ %I:%M %p')}" for dt, name in upcoming]
+        lines = []
+        for dt, name, confirmed in upcoming:
+            if confirmed == "confirmed":
+                tag = " ✓"
+            elif confirmed == "unconfirmed":
+                tag = " ⚠ unconfirmed"
+            else:
+                tag = ""
+            lines.append(f"• **{name}** — {dt.strftime('%a, %d %b @ %I:%M %p')}{tag}")
         st.info("**Upcoming viewings (next 7 days)**\n\n" + "\n\n".join(lines))
 
 
@@ -952,6 +1019,7 @@ def render_overview(filtered: pd.DataFrame) -> None:
                 "nearest_mrt_station",
                 "nearest_mrt_minutes",
                 "booking_time",
+                "booking_confirmed",
                 "agent_contact",
                 "viewed_unit",
                 "viewing_outcome",
@@ -967,6 +1035,7 @@ def render_overview(filtered: pd.DataFrame) -> None:
                 "nearest_mrt_station": "Nearest MRT",
                 "nearest_mrt_minutes": "Distance to MRT",
                 "booking_time": "Booking time",
+                "booking_confirmed": "Confirmed",
                 "agent_contact": "Agent / Contact",
                 "viewed_unit": "Viewed",
                 "viewing_outcome": "Outcome",
@@ -1015,7 +1084,7 @@ def render_listing_detail(selected: pd.Series) -> None:
                 <div class="detail-tile"><div class="label">Address</div><div class="value">{selected['address']}</div></div>
                 <div class="detail-tile"><div class="label">Nearest MRT</div><div class="value">{selected['nearest_mrt_station'] or 'Not listed'}</div></div>
                 <div class="detail-tile"><div class="label">MRT Distance</div><div class="value">{format_number(selected['nearest_mrt_minutes'], ' min')}</div></div>
-                <div class="detail-tile"><div class="label">Booking Time</div><div class="value">{selected['booking_time'] or 'Not listed'}</div></div>
+                <div class="detail-tile"><div class="label">Booking Time</div><div class="value">{selected['booking_time'] or 'Not listed'}{' ✓' if selected['booking_confirmed'] == 'confirmed' else (' ⚠' if selected['booking_confirmed'] == 'unconfirmed' else '')}</div></div>
                 <div class="detail-tile"><div class="label">Agent / Contact</div><div class="value">{selected['agent_contact'] or 'Not listed'}</div></div>
                 <div class="detail-tile"><div class="label">Viewed</div><div class="value">{selected['viewed_unit']}</div></div>
                 <div class="detail-tile"><div class="label">Outcome</div><div class="value">{selected['viewing_outcome']}</div></div>
