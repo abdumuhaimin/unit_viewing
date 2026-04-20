@@ -970,24 +970,34 @@ def render_hero(filtered: pd.DataFrame) -> None:
             )
 
     now = datetime.now(SINGAPORE_TIMEZONE)
-    upcoming = []
+    upcoming_confirmed = []
+    upcoming_unconfirmed = []
     for _, row in filtered.iterrows():
         dt = parse_booking_datetime(row.get("booking_time"), now)
         if dt and now <= dt <= now + timedelta(days=7):
             confirmed = text_value(row.get("booking_confirmed"))
-            upcoming.append((dt, text_value(row.get("listing_name")), confirmed))
-    if upcoming:
-        upcoming.sort()
-        lines = []
-        for dt, name, confirmed in upcoming:
+            entry = (dt, text_value(row.get("listing_name")))
             if confirmed == "confirmed":
-                tag = " ✓"
-            elif confirmed == "unconfirmed":
-                tag = " ⚠ unconfirmed"
+                upcoming_confirmed.append(entry)
             else:
-                tag = ""
-            lines.append(f"• **{name}** — {dt.strftime('%a, %d %b @ %I:%M %p')}{tag}")
-        st.info("**Upcoming viewings (next 7 days)**\n\n" + "\n\n".join(lines))
+                upcoming_unconfirmed.append(entry)
+    if upcoming_confirmed or upcoming_unconfirmed:
+        upcoming_confirmed.sort()
+        upcoming_unconfirmed.sort()
+        parts = []
+        if upcoming_confirmed:
+            confirmed_lines = [
+                f"• **{name}** — {dt.strftime('%a, %d %b @ %I:%M %p')} ✓"
+                for dt, name in upcoming_confirmed
+            ]
+            parts.append("**✓ Confirmed**\n\n" + "\n\n".join(confirmed_lines))
+        if upcoming_unconfirmed:
+            unconfirmed_lines = [
+                f"• **{name}** — {dt.strftime('%a, %d %b @ %I:%M %p')} ⚠"
+                for dt, name in upcoming_unconfirmed
+            ]
+            parts.append("**⚠ Unconfirmed**\n\n" + "\n\n".join(unconfirmed_lines))
+        st.info("**Upcoming viewings (next 7 days)**\n\n" + "\n\n---\n\n".join(parts))
 
 
 def render_overview(filtered: pd.DataFrame) -> None:
@@ -1236,36 +1246,47 @@ def render_review_form(selected: pd.Series, reviews: pd.DataFrame) -> None:
 def render_tracker(data: pd.DataFrame) -> None:
     booked = data[data["booking_time"].astype(str).str.strip() != ""].copy()
     if not booked.empty:
-        st.subheader("Booked Viewings")
         booked["google_calendar_url"] = booked.apply(build_google_calendar_url, axis=1)
-        booked_view = booked[
-            [
-                "listing_name",
-                "booking_time",
-                "agent_contact",
-                "address",
-                "google_calendar_url",
-            ]
-        ].rename(
-            columns={
-                "listing_name": "Listing",
-                "booking_time": "Booking time",
-                "agent_contact": "Agent / Contact",
-                "address": "Address",
-                "google_calendar_url": "Google Calendar",
-            }
-        )
-        st.dataframe(
-            booked_view,
-            hide_index=True,
-            width="stretch",
-            column_config={
-                "Google Calendar": st.column_config.LinkColumn(
-                    "Google Calendar",
-                    display_text="Open invite",
-                )
-            },
-        )
+        confirmed_booked = booked[booked["booking_confirmed"] == "confirmed"]
+        unconfirmed_booked = booked[booked["booking_confirmed"] != "confirmed"]
+
+        def _render_booked_table(df: pd.DataFrame) -> None:
+            view = df[
+                [
+                    "listing_name",
+                    "booking_time",
+                    "agent_contact",
+                    "address",
+                    "google_calendar_url",
+                ]
+            ].rename(
+                columns={
+                    "listing_name": "Listing",
+                    "booking_time": "Booking time",
+                    "agent_contact": "Agent / Contact",
+                    "address": "Address",
+                    "google_calendar_url": "Google Calendar",
+                }
+            )
+            st.dataframe(
+                view,
+                hide_index=True,
+                width="stretch",
+                column_config={
+                    "Google Calendar": st.column_config.LinkColumn(
+                        "Google Calendar",
+                        display_text="Open invite",
+                    )
+                },
+            )
+
+        if not confirmed_booked.empty:
+            st.subheader("✓ Confirmed Viewings")
+            _render_booked_table(confirmed_booked)
+
+        if not unconfirmed_booked.empty:
+            st.subheader("⚠ Unconfirmed Viewings")
+            _render_booked_table(unconfirmed_booked)
 
     st.subheader("Review Tracker")
     reviewed = data[data["review_status"] != "Not reviewed"].copy()
