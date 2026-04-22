@@ -326,7 +326,7 @@ def extract_booking_confirmation(workbook_source: str | BytesIO) -> dict[tuple[s
         for row_idx, row in enumerate(ws.iter_rows(min_row=2)):
             booking_cell = row[booking_col - 1]
             if booking_cell.value:
-                status = "unconfirmed" if _is_red_font(booking_cell) else "confirmed"
+                status = "confirmed" if _is_red_font(booking_cell) else "unconfirmed"
                 result[(sheet_name, row_idx)] = status
     return result
 
