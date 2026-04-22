@@ -296,7 +296,8 @@ def listing_label(row: pd.Series) -> str:
     return f"{badge} {row['listing_name']} | {format_currency(row['monthly_rent'])} | {row['source_sheet']}{booking_suffix}"
 
 
-def _is_red_font(cell: object) -> bool:
+def _booking_font_status(cell: object) -> str | None:
+    """Return 'confirmed' for red font, 'unconfirmed' for orange font, None otherwise."""
     try:
         color = cell.font.color  # type: ignore[attr-defined]
         if color.type == "rgb":
@@ -304,10 +305,13 @@ def _is_red_font(cell: object) -> bool:
             r = int(rgb[2:4], 16)
             g = int(rgb[4:6], 16)
             b = int(rgb[6:8], 16)
-            return r > 150 and g < 100 and b < 100
+            if r > 150 and g < 100 and b < 100:
+                return "confirmed"
+            if r > 150 and 80 <= g < 200 and b < 80:
+                return "unconfirmed"
     except Exception:
         pass
-    return False
+    return None
 
 
 def extract_booking_confirmation(workbook_source: str | BytesIO) -> dict[tuple[str, int], str]:
@@ -326,8 +330,9 @@ def extract_booking_confirmation(workbook_source: str | BytesIO) -> dict[tuple[s
         for row_idx, row in enumerate(ws.iter_rows(min_row=2)):
             booking_cell = row[booking_col - 1]
             if booking_cell.value:
-                status = "unconfirmed" if _is_red_font(booking_cell) else "confirmed"
-                result[(sheet_name, row_idx)] = status
+                status = _booking_font_status(booking_cell)
+                if status is not None:
+                    result[(sheet_name, row_idx)] = status
     return result
 
 
